@@ -1,98 +1,121 @@
-"""
-跨设备环境合规自检脚本 (Machine Baseline Verification)
-用于在新电脑（电脑 B）或任何部署目标机上一键验证“方案 C 物理级 0 弹窗”是否完全就绪。
-"""
-
-import os
+"""核验独立 Hook 配置与决策，不把机器自检等同于应用或双机验收。"""
+from __future__ import annotations
+import argparse
+import hashlib
+import importlib.util
+import json
+import plistlib
+import shlex
 import sys
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 
-def run_verification():
-    print("=" * 60)
-    print(" 🚀 跨设备物理级 0 弹窗基线自检 (方案 C 验证程序) ")
-    print("=" * 60)
+ROOT = Path(__file__).resolve().parent.parent
+NAME = 'intelligent-safety-gate'
 
-    # 1. 动态锚定工作区根目录
-    current_file = Path(__file__).resolve()
-    ws_root = None
-    for p in [current_file.parent] + list(current_file.parents):
-        if (p / "AGENTS.md").exists():
-            ws_root = p
-            break
-    
-    if not ws_root:
-        print("❌ [FAIL] 未能在当前路径及其上级目录中找到 AGENTS.md 根文件！")
-        return False
-    
-    print(f"✅ [1/6] 动态工作区根目录定位成功: {ws_root}")
-    
-    # 2. 检查 AGENTS.md 是否包含方案 C 绝对铁律
-    agents_content = (ws_root / "AGENTS.md").read_text(encoding="utf-8")
-    if "物理级 0 弹窗铁律" in agents_content and "guard_path" in agents_content:
-        print("✅ [2/6] AGENTS.md 核心规范对齐: 已包含方案 C 物理级 0 弹窗规约")
-    else:
-        print("❌ [FAIL] AGENTS.md 未能检测到方案 C 核心条款，请重新同步！")
-        return False
+def sha(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
-    # 3. 检查 .gitignore 隔离规则
-    gitignore_path = ws_root / ".gitignore"
-    if gitignore_path.exists() and ".tmp_*/" in gitignore_path.read_text(encoding="utf-8"):
-        print("✅ [3/6] .gitignore 安全配置就绪: 临时目录与时间戳缓存已受控忽略")
-    else:
-        print("⚠️ [WARN] .gitignore 不存在或未包含 .tmp_ 规则，建议补全。")
+def load(path):
+    spec = importlib.util.spec_from_file_location('machine_gate', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
-    # 4. 检查 .agents/rules/zero_popup_interlock.md 专项联锁规约
-    interlock_path = ws_root / ".agents" / "rules" / "zero_popup_interlock.md"
-    if interlock_path.exists() and "0-Popup SLA" in interlock_path.read_text(encoding="utf-8"):
-        print("✅ [4/6] zero_popup_interlock.md 专项联锁规约就绪: 双重硬锁已激活")
-    else:
-        print("❌ [FAIL] 未能检测到 .agents/rules/zero_popup_interlock.md 规约文件！")
-        return False
+def verify(workspace, home, source_only=False):
+    report = {'checked_at_utc': datetime.now(timezone.utc).isoformat(),
+              'workspace': str(workspace), 'checks': [], 'cases': [],
+              'application_ui': '未验证', 'two_restarts': '未验证', 'other_machine': '未验证'}
+    def check(name, passed, detail=''):
+        report['checks'].append({'name': name, 'passed': bool(passed), 'detail': detail})
+    base = ROOT / 'scripts' if source_only else home / '.gemini/config/scripts'
+    manifest = json.loads((ROOT / 'scripts/gate_manifest.json').read_text())
+    report['policy_version'] = manifest['version']
+    report['policy_hashes'] = manifest['files']
+    for name, expected in manifest['files'].items():
+        path = base / name
+        check(name, path.is_file() and not path.is_symlink() and sha(path) == expected)
+    if not source_only:
+        hook_path = home / '.gemini/config/hooks.json'
+        hooks = json.loads(hook_path.read_text())
+        definition = hooks.get(NAME, {})
+        check('全局 Hook 已启用', definition.get('enabled', True) and bool(definition.get('PreToolUse')))
+        for event, phase in [('PreToolUse', 'pre'), ('PostToolUse', 'post')]:
+            groups = definition.get(event, [])
+            commands = [h.get('command', '') for group in groups for h in group.get('hooks', [])]
+            expected_path = str(base / 'security_gate.py')
+            check(event, len(commands) == 1 and len(shlex.split(commands[0])) == 4 and
+                  shlex.split(commands[0])[1:] == ['-I', expected_path, phase])
+        report['hooks_sha256'] = sha(hook_path)
+        for name in ('AGENTS.md', '.agents/rules/zero_popup_interlock.md', 'scripts/sandbox_guard.py'):
+            path = workspace / name
+            check('工作区 ' + name, path.is_file() and sha(path) == sha(ROOT / name))
+    check('工作区存在', workspace.is_dir())
+    if not all(c['passed'] for c in report['checks']):
+        report['status'] = 'failed'
+        return report
+    gate = load(base / 'security_gate.py')
+    with tempfile.TemporaryDirectory(prefix='.tmp_gate_check_', dir=workspace) as tmp:
+        area = Path(tmp).resolve()
+        original = area / 'user.txt'
+        original.write_text('必须保留')
+        cid = '00000000-0000-4000-8000-000000000001'
+        payload = {'conversationId': cid, 'workspacePaths': [str(area)],
+                   'toolCall': {'name': 'run_command', 'args': {'Cwd': str(area), 'CommandLine': 'pwd'}}}
+        cases = [
+            ('只读目录', 'pwd', 'allow'),
+            ('字符串替换', 'python3 -c "text=\'ab\'; print(text.replace(\'a\',\'b\'))"', 'allow'),
+            ('丢弃标准错误', 'python3 -c "import sys; print(sys.executable)" && ls -d /Applications/*[Cc]alibre* 2>/dev/null || true', 'allow'),
+            ('真实删除', 'rm -rf user.txt', 'force_ask'),
+            ('脚本带参数删除', 'python3 -B danger.py --flag', 'force_ask'),
+            ('受保护配置', 'cat .ssh/id_rsa', 'force_ask'),
+            ('用户文件覆盖', 'echo changed > user.txt', 'force_ask'),
+            ('动态执行', 'python3 -c "eval(\'1\')"', 'force_ask'),
+        ]
+        (area / 'danger.py').write_text("import shutil\nshutil.rmtree('user.txt')")
+        for label, command, expected in cases:
+            payload['toolCall'] = {'name': 'run_command', 'args': {'Cwd': str(area), 'CommandLine': command}}
+            result = gate.Gate(payload, state_dir=area / 'state').evaluate()
+            report['cases'].append({'name': label, 'expected': expected, **result,
+                                    'passed': result['decision'] == expected})
+        for app in ('antigravity', 'antigravity-ide', 'antigravity-cli'):
+            artifact = Path.home() / '.gemini' / app / 'brain' / cid
+            sample = {**payload, 'artifactDirectoryPath': str(artifact),
+                      'toolCall': {'name': 'write_to_file', 'args': {'TargetFile': str(artifact / 'task.md'), 'CodeContent': 'fixture'}}}
+            # 只评估 Hook，不实际创建宿主 Artifact。
+            result = gate.Gate(sample, state_dir=area / 'state').evaluate()
+            report['cases'].append({'name': app + ' Artifact 适配', 'expected': 'allow', **result, 'passed': result['decision'] == 'allow'})
+        outside = area.parent / (area.name + '-outside.txt')
+        sample = {**payload, 'toolCall': {'name': 'write_to_file', 'args': {'TargetFile': str(outside), 'CodeContent': 'fixture'}}}
+        result = gate.Gate(sample, state_dir=area / 'state').evaluate()
+        report['cases'].append({'name': '越界写入', 'expected': 'force_ask', **result, 'passed': result['decision'] == 'force_ask'})
+        payload['toolCall'] = {'name': 'run_command', 'args': {'Cwd': str(area), 'CommandLine': 'pwd'}}
+        result = gate.Gate(payload, state_dir=area / 'state', dcg=area / 'missing-checker').evaluate()
+        report['cases'].append({'name': '检查器缺失', 'expected': 'force_ask', **result, 'passed': result['decision'] == 'force_ask'})
+        check('候选高危调用无副作用', original.read_text() == '必须保留' and not outside.exists())
+    report['apps'] = {}
+    for app in ('Antigravity', 'Antigravity IDE'):
+        path = Path('/Applications') / (app + '.app/Contents/Info.plist')
+        if path.is_file():
+            report['apps'][app] = plistlib.loads(path.read_bytes()).get('CFBundleShortVersionString')
+    report['status'] = 'passed' if all(c['passed'] for c in report['checks'] + report['cases']) else 'failed'
+    report['scope'] = '源码决策自检' if source_only else '配置落盘与独立 Hook 决策自检；不证明应用实际加载'
+    return report
 
-    # 5. 验证公共物理守卫库 sandbox_guard.py
-    guard_script = ws_root / "scripts" / "sandbox_guard.py"
-    if not guard_script.exists():
-        print("❌ [FAIL] 未找到 scripts/sandbox_guard.py 核心守卫模块！")
-        return False
-    
-    # 动态导入验证
-    sys.path.insert(0, str(ws_root / "scripts"))
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--workspace', type=Path, default=ROOT)
+    parser.add_argument('--home', type=Path, default=Path.home())
+    parser.add_argument('--source-only', action='store_true')
+    parser.add_argument('--output', type=Path)
+    args = parser.parse_args()
     try:
-        import sandbox_guard
-        test_tmp = sandbox_guard.setup_workspace_tmpdir("machine_check")
-        assert str(test_tmp).startswith(str(ws_root.resolve())), "临时目录越出工作区！"
-        assert os.environ.get("TMPDIR") == str(test_tmp), "TMPDIR 环境变量未成功重定向！"
-        
-        # 测试越界拦截能力
-        escaped_path = Path("/tmp/should_be_blocked.txt")
-        blocked = False
-        try:
-            sandbox_guard.guard_path(escaped_path)
-        except RuntimeError:
-            blocked = True
-        
-        if not blocked:
-            print("❌ [FAIL] 物理路径守卫 guard_path 未能成功阻击外部越界路径！")
-            return False
-            
-        print("✅ [5/6] 物理守卫与断言测试通过: guard_path 与环境变量隔离 100% 正常")
-        
-        # 清理测试目录
-        if test_tmp.exists():
-            test_tmp.rmdir()
-            
-    except Exception as e:
-        print(f"❌ [FAIL] 导入或测试 sandbox_guard 异常: {e}")
-        return False
-
-    # 6. 跨设备用户名动态适配检查
-    print(f"✅ [6/6] 本机绝对路径宿主适配: {Path.home()} -> 动态适配成功（无写死硬编码）")
-    
-    print("=" * 60)
-    print(" 🏆 本机已完全就绪！具备 100% 物理级 0 弹窗与自主闭环能力！")
-    print("=" * 60)
-    return True
-
-if __name__ == "__main__":
-    success = run_verification()
-    sys.exit(0 if success else 1)
+        result = verify(args.workspace.expanduser().resolve(), args.home.expanduser().resolve(), args.source_only)
+    except Exception as error:
+        result = {'status': 'failed', 'error': str(error)}
+    text = json.dumps(result, ensure_ascii=False, indent=2) + '\n'
+    if args.output:
+        args.output.write_text(text)
+    print(text)
+    sys.exit(0 if result['status'] == 'passed' else 1)

@@ -50,62 +50,17 @@
 ## 工具调用路由
 涉及任何网页访问、浏览器操作、页面测试、表单填写、登录验证及数据抓取任务时，必须默认调用本地 ego-browser 技能执行，严禁调用 IDE 内置的无头浏览器或 browser_subagent。
 
-## 无人值守与长任务免弹窗执行硬约束（最高优先级·物理级 0 弹窗铁律）
+## 常规任务与权限边界
 
-### 1. 物理级 0 弹窗本质认知与绝对红线
-1. **弹窗机理定性**：IDE 弹窗是宿主操作系统与 IDE 安全内核的**硬物理防线（Hard Constraint）**。提示词只是软约束（Soft Constraint），根本无法越过底层沙箱。
-2. **macOS 软链接陷阱**：严禁在任何地方使用 `/tmp`、`/private/tmp`、`/var` 或 Python 的 `tempfile.gettempdir()`！macOS 会将 `/tmp` 解析为 `/private/tmp`，直接击穿工作区白名单，触发 IDE 同步挂起（Sync Block）导致长任务永久死锁。
-3. **警示反例与正例（吴军 PDF 批处理案例）**：
-   - ❌ **反例**：脚本写 `/tmp/wj01_clean.md` → Agent 调用工具读取 → 解析为 `/private/tmp/...` → 触发权限弹窗 → 任务彻底卡死。
-   - ✅ **正例**：脚本写 `WORKSPACE_ROOT/.tmp_pdf_unpack/wj01_clean.md` → 原生工具静默读取 → 100% 物理级 0 弹窗。
-4. **永远不要迷信“Always allow”**：点击“Always allow”只是把有毒路径加入临时白名单，属于治标不治本；**真正的根治是永远不产生任何一个工作区外的物理路径！**
-
-### 2. 物理工作区锁死（100% Workspace-Scoped）
-1. **唯一受信读写域**：所有临时文件、中间数据、解压缓存、处理脚本，必须 100% 锁死在当前工作区根目录（`WORKSPACE_ROOT`）内部，严禁向外溢出任何一个字节。
-2. **路径命名规范**：
-   - 临时/中间目录：统一命名为 `WORKSPACE_ROOT/.tmp_<任务标识>/`（如 `.tmp_pdf_unpack/`）；
-   - 交付目录：统一存放在工作区下明确命名的子目录中（如 `<项目名>-Markdown精排版/`）；
-   - 任务结束后由脚本在工作区内部自主静默回收，严禁在系统级目录留存残留垃圾。
-
-### 3. 工具调用降级阶梯与自主闭环规则
-1. **第一梯队（原生工具绝对优先）**：凡是文本读取、代码检索、文件修改、状态检查，**必须 100% 使用原生工具**（`view_file`、`replace_file_content`、`write_to_file`），在此场景下 `run_command` 调用次数 = 0。
-2. **第二梯队（重计算与批处理自主闭环）**：处理二进制解析（PDF/EPUB）、音视频转码等原生工具无法处理的长耗时批处理时，**Agent 自主封装单一原子 Python 脚本并在标准沙箱内执行**，必须同时满足以下硬性条件：
-   - 必须使用标准沙箱（`BypassSandbox: false`），严禁请求系统提权；
-   - 脚本内必须内嵌 `guard_path()` 物理断言与临时目录重定向；
-   - 严禁拆解为循环命令行，严禁在执行期间使用 `run_command` 频繁轮询 `ps`、`tail`、`status`；
-   - 进度通过工作区内部的 `progress.json` 记录，Agent 仅通过 `view_file` 非阻塞读取。
-3. **第三梯队（高危外部操作主动降级）**：若任务确实需要访问外网、修改系统全局配置或涉及非受信环境，Agent 严禁擅自弹窗索权，必须主动停止并输出单条清晰命令供用户本地手动执行。
-
-### 4. 破坏性命令守卫与安全避让（DCG 防御）
-1. 严禁在自动化脚本或命令行中使用高危破坏性 Shell 指令（如 `rm -rf`、`kill -9`、带递归参数的强制删除命令），防止触发 IDE 的 Destructive Command Guard 强拦截弹窗。
-2. 严禁在命令行中使用内联代码（如 `python3 -c "import shutil; shutil.rmtree(...)"` 或 `os.rmdir`）执行删除，此类内联语法模式会被 DCG 静态分析直接识别并阻断；所有文件与缓存清理必须固化在工程 `.py` 脚本文件内部（如 `python3 scripts/clean.py`）安全执行，或通过 `.gitignore` 静默忽略。
-
-### 5. 批处理脚本强制内嵌 Python 防御模板
-所有由 Agent 生成并执行的批处理脚本，顶部必须强制内嵌以下防御守卫逻辑：
-
-```python
-import os
-import sys
-from pathlib import Path
-
-# 1. 动态锚定工作区根目录（适配真实环境，不写死硬编码）
-WORKSPACE_ROOT = Path(__file__).resolve().parent
-
-# 2. 强行重定向系统临时目录环境变量，物理拦截第三方库的越界写入冲动
-TMP_DIR = WORKSPACE_ROOT / ".tmp_pipeline"
-TMP_DIR.mkdir(parents=True, exist_ok=True)
-os.environ["TMPDIR"] = str(TMP_DIR)
-os.environ["TEMP"] = str(TMP_DIR)
-os.environ["TMP"] = str(TMP_DIR)
-
-# 3. 物理路径安全守卫 (Guard Assertion)
-def guard_path(p: Path) -> Path:
-    resolved_path = p.resolve()
-    if not str(resolved_path).startswith(str(WORKSPACE_ROOT.resolve())):
-        raise RuntimeError(f"[FATAL SECURITY] 越界物理路径禁止访问: {resolved_path}")
-    return resolved_path
-```
-
+- 工程规则是操作指导，不替代 Hook、原生权限或操作系统沙箱，不承诺任意任务零弹窗。
+- 优先使用原生读写工具；允许必要的只读终端检查，例如 `git status`、`git diff`。不要根据上下文猜测实际状态。
+- 删除、移动、受保护配置修改、越界写入、未知调用和检查失败保留询问。把删除放进脚本不能获得自动批准。
+- 临时文件在当前实际工作区内生成；先调用 `guard_path()` 再创建，每个实际读写路径都要校验。`TMPDIR` 不等于沙箱；`tempfile` API 明确传 `dir=已校验目录`。
+- 使用 `Path.resolve()` 和真实目录包含关系，拒绝兄弟目录前缀混淆；执行期间的路径竞争仍依赖原生沙箱限制。
+- 不能凭 `.tmp_` 目录名推断所有权。本会话新建文件只有完成事件成功且内容哈希吻合后，才允许后续整文件更新；用户后续修改过的内容需要确认。
+- 字符串 `replace()` 与文件 `Path.replace()` 不等价。只有确定类型的字符串清洗可自动批准；未知 Python 方法和依赖需审查。
+- 固定文本清洗入口为安装后的 `~/.gemini/config/scripts/scoped_text_job.py`，JSON 仅描述输入、输出和字符串替换，不执行代码。覆盖已有成果仍需确认并备份。
+- 交付分别报告文件一致、配置落盘、Hook 调用、真实应用行为、两次重启保持和双机结果。没有现场证据的层级标记待验证。
 
 ## 工作方法论
 

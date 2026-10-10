@@ -14,3 +14,6 @@ __pycache__/
 *.py[cod]
 *$py.class
 .pytest_cache/
+machine-check*.json
+safety_gate_state/
+.pipeline_backups/
