@@ -1,0 +1,16 @@
+# Pipeline temporary caches and unpacked buffers (0-popup physical sandbox)
+.tmp_*/
+.tmp_pdf_unpack/
+.tmp_pipeline/
+.pipeline_cache/
+
+# Backup and timestamped snapshot files
+*.bak-*
+*.bak
+*.tmp
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
